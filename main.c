@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <assert.h>
+#include <time.h>
 
 #include "utility.h"
 
@@ -19,6 +20,7 @@
 
 
 FILE* DictionaryUsed;
+FILE *logFile;
 int PortUsed;
 char* WordBank[MAX_DICTIONARY_WORD_COUNT];
 int listeningSocket;
@@ -26,12 +28,17 @@ int listeningSocket;
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t empty = PTHREAD_COND_INITIALIZER;
 pthread_cond_t fill = PTHREAD_COND_INITIALIZER;
+pthread_cond_t emptyLog = PTHREAD_COND_INITIALIZER;
+pthread_cond_t fillLog = PTHREAD_COND_INITIALIZER;
 
 void initialSetup(int argc, char *const *argv);
 int isValidWord(const char* word);
 void setupWordBank(void);
 void printDictionary();
 int open_listenfd(int port);
+void createLogFile(void);
+void logMessage(char*);
+void closeLogFile(void);
 
 int isFull();
 void enQueue(int element);
@@ -44,6 +51,13 @@ void Pthread_mutex_unlock(pthread_mutex_t *mutex);
 void Pthread_cond_signal(pthread_cond_t* cv);
 void Pthread_cond_wait(pthread_cond_t* cv, pthread_mutex_t* mutex);
 
+int isFullLog(void);
+int isEmptyLog(void);
+void enQueueLog(char* element);
+char* deQueueLog(void);
+void displayLog(void);
+void *consumerLog(void *arg);
+
 void producer(void);
 void *consumer(void*);
 void serviceClient(int socketDescriptor);
@@ -51,6 +65,8 @@ void serviceClient(int socketDescriptor);
 int main(int argc, char *argv[]) {
     initialSetup(argc, argv);
     setupWordBank();
+    createLogFile();
+
 
     listeningSocket = open_listenfd(PortUsed);
     printf("Listening on port %d\n", PortUsed);
@@ -60,11 +76,17 @@ int main(int argc, char *argv[]) {
     printf("Launching threads.\n");
     for (int i = 0; i < NUM_WORKERS; i++) {
         threadIDs[i] = i;
-        pthread_create(&threadPool[i], NULL, &consumer, &threadIDs[i]);
+        if (i == NUM_WORKERS-1) {
+            pthread_create(&threadPool[i], NULL, &consumerLog, &threadIDs[i]);
+        } else {
+            pthread_create(&threadPool[i], NULL, &consumer, &threadIDs[i]);
+        }
     }
     printf("Threads launched. Now listening for incoming requests...\n");
 
     producer();
+
+    fclose(logFile);
 
     return EXIT_SUCCESS;
 }
@@ -114,8 +136,7 @@ void serviceClient(int socketDescriptor) {
     buffer[0] = '\0';
 
     while (recv(socketDescriptor, buffer, bufferSize, 0) != 0) {
-        printf("received: %s\n", buffer);
-        char *temp = malloc(MAX_DICTIONARY_WORD_SIZE);
+        char *temp = malloc(MAX_DICTIONARY_WORD_SIZE * sizeof(char));
         if(buffer[0] != '\r' && buffer[0] != '\n') {
             strcat(temp, removeUnwantedCharacters(buffer));
 
@@ -126,13 +147,49 @@ void serviceClient(int socketDescriptor) {
             }
 
             send(socketDescriptor, temp, strlen(temp), 0);
-            // TODO write to log
+
+            char* toBeLogged = strdup(temp);
             free(temp);
+
+            // TODO write to log
+            pthread_mutex_lock(&lock);
+            while(isFullLog()) {
+                pthread_cond_wait(&emptyLog, &lock);
+            }
+
+            char* formatBuffer = malloc(MAX_DICTIONARY_WORD_SIZE * sizeof(char));
+            sprintf(formatBuffer, "Socket %d: %s", socketDescriptor, toBeLogged);
+            free(toBeLogged);
+
+            enQueueLog(formatBuffer);  // "put()"
+            Pthread_cond_signal(&fillLog);
+            Pthread_mutex_unlock(&lock);
+            free(formatBuffer);
+
         } else {
             send(socketDescriptor, "", strlen(""), 0);
         }
     }
     free(buffer);
+}
+
+void *consumerLog(void *arg) {
+    while (1) {
+        Pthread_mutex_lock(&lock);
+
+        while (isEmptyLog()) {
+            Pthread_cond_wait(&fillLog, &lock);
+        }
+        char* finalLogMessage = deQueueLog();  // "get()"
+        Pthread_cond_signal(&emptyLog);
+        Pthread_mutex_unlock(&lock);
+
+        logMessage(strdup(finalLogMessage));
+
+        free(finalLogMessage);
+        // TODO log the file
+
+    }
 }
 
 void printDictionary() {  // For testing
@@ -289,6 +346,66 @@ void display()
     }
 }
 
+volatile char* itemsLog[MAX_QUEUE_SIZE];  // the actual queue
+volatile int frontLog = -1, rearLog =-1;
+int isFullLog()
+{
+    if( (frontLog == rearLog + 1) || (frontLog == 0 && rearLog == MAX_QUEUE_SIZE-1)) return 1;
+    return 0;
+}
+int isEmptyLog()
+{
+    if(frontLog == -1) return 1;
+    return 0;
+}
+void enQueueLog(char* element)
+{
+    if (isFullLog()) printf("\n Log Queue is full!! \n");
+    else
+    {
+        if(frontLog == -1) frontLog = 0;
+        rearLog = (rearLog + 1) % MAX_QUEUE_SIZE;
+        itemsLog[rearLog] = strdup(element);
+        printf("\n Inserted -> %s", element);
+    }
+}
+char* deQueueLog()
+{
+    char* element;
+    if(isEmptyLog()) {
+        printf("\n Log Queue is empty !! \n");
+        return("");
+    } else {
+        element = itemsLog[frontLog];
+        if (frontLog == rearLog){
+            frontLog = -1;
+            rearLog = -1;
+        } /* Q has only one element, so we reset the queue after dequeing it. ? */
+        else {
+            frontLog = (frontLog + 1) % MAX_QUEUE_SIZE;
+
+        }
+        printf("\n Deleted element -> %s \n", element);
+        return(element);
+    }
+
+}
+void displayLog()
+{
+    int i;
+    if(isEmptyLog()) printf(" \n Empty Log Queue\n");
+    else
+    {
+        printf("\n Front -> %d ",frontLog);
+        printf("\n Items -> ");
+        for( i = frontLog; i!=rearLog; i=(i+1)%MAX_QUEUE_SIZE) {
+            printf("%s ",itemsLog[i]);
+        }
+        printf("%s ",itemsLog[i]);
+        printf("\n Rear -> %d \n", rearLog);
+    }
+}
+
 void Pthread_mutex_lock(pthread_mutex_t *mutex) {
     int rc = pthread_mutex_lock(mutex);
     assert(rc == 0);
@@ -307,4 +424,25 @@ void Pthread_cond_wait(pthread_cond_t* cv, pthread_mutex_t* mutex) {
 void Pthread_cond_signal(pthread_cond_t* cv) {
     int rc = pthread_cond_signal(cv);
     assert(rc == 0);
+}
+
+void createLogFile() {
+    time_t     now;
+    struct tm *ts;
+    char       buf[80];
+
+    /* Get the current time */
+    now = time(NULL);
+
+    /* Format and print the time, "ddd yyyy-mm-dd hh:mm:ss zzz" */
+    ts = localtime(&now);
+    strftime(buf, sizeof(buf), "---------%Y-%m-%d-%H:%M:%S-%Z---------\n", ts);
+
+    logFile = fopen("log.txt", "w+");
+    fputs(buf, logFile);
+}
+
+void logMessage(char *message) {
+    fputs(message, logFile);
+    fflush(logFile);
 }

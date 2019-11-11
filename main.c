@@ -1,6 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <assert.h>
+
 #include "utility.h"
 
 #define MAX_ARR_SIZE 2048
@@ -8,24 +14,114 @@
 #define MAX_DICTIONARY_WORD_COUNT 110000  // 110,000
 #define DEFAULT_PORT 4444
 #define DEFAULT_DICTIONARY "words"
+#define NUM_WORKERS 20
+#define MAX_QUEUE_SIZE 2048
 
 
 FILE* DictionaryUsed;
 int PortUsed;
 char* WordBank[MAX_DICTIONARY_WORD_COUNT];
+int listeningSocket;
+
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t empty = PTHREAD_COND_INITIALIZER;
+pthread_cond_t fill = PTHREAD_COND_INITIALIZER;
 
 void initialSetup(int argc, char *const *argv);
 int isValidWord(const char* word);
 void setupWordBank(void);
 void printDictionary();
+int open_listenfd(int port);
+
+int isFull();
+void enQueue(int element);
+int isEmpty();
+int deQueue();
+void display();
+void Pthread_mutex_lock(pthread_mutex_t *mutex);
+void Pthread_mutex_unlock(pthread_mutex_t *mutex);
+void Pthread_cond_signal(pthread_cond_t* cv);
+void Pthread_cond_wait(pthread_cond_t* cv, pthread_mutex_t* mutex);
+
+void producer(void);
+void *consumer(void*);
+void serviceClient(int socketDescriptor);
 
 int main(int argc, char *argv[]) {
     initialSetup(argc, argv);
     setupWordBank();
 
-    printf("Dictionary: %p Port Number: %d\n", DictionaryUsed, PortUsed);
+    listeningSocket = open_listenfd(PortUsed);
 
-    return 0;
+    pthread_t threadPool[NUM_WORKERS];
+    int threadIDs[NUM_WORKERS];
+    printf("Launching threads.\n");
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        threadIDs[i] = i;
+        pthread_create(&threadPool[i], NULL, &consumer, &threadIDs[i]);
+    }
+    printf("Threads launched. Now listening for incoming requests...\n");
+
+
+    while (1) {
+        producer();
+    }
+
+    return EXIT_SUCCESS;
+}
+
+void producer() {
+    int connectionSocket;
+
+    while (1) {
+        Pthread_mutex_lock(&lock);
+        connectionSocket = accept(listeningSocket, NULL, NULL);  // connectionSocket is the file descriptor
+
+        while (isFull()) {
+            Pthread_cond_wait(&empty, &lock);
+        }
+        enQueue(connectionSocket);  // "put()"
+        pthread_cond_broadcast(&fill);
+        Pthread_mutex_unlock(&lock);
+
+    }
+}
+
+void *consumer(void *arg) {
+    while (1) {
+        Pthread_mutex_lock(&lock);
+
+        while (isEmpty()) {
+            Pthread_cond_wait(&fill, &lock);
+        }
+        int socketDescriptor = deQueue();  // "get()"
+        serviceClient(socketDescriptor);
+
+        pthread_cond_broadcast(&empty);
+        Pthread_mutex_unlock(&lock);
+
+        // TODO close socket
+        shutdown(socketDescriptor, SHUT_RDWR);
+    }
+}
+
+
+void serviceClient(int socketDescriptor) {
+    while (!isEmpty()) {
+        char buffer[MAX_DICTIONARY_WORD_SIZE];
+        size_t bufferSize = MAX_DICTIONARY_WORD_SIZE * sizeof(char);
+        recv(socketDescriptor, buffer, bufferSize, 0);
+        if (strlen(buffer) == 0) continue;
+
+        if (isValidWord(buffer)) {
+            strcat(buffer, " OK");
+        } else {
+            strcat(buffer, " MISSPELLED");
+        }
+
+        send(socketDescriptor, buffer, strlen(buffer), 0);
+        // TODO write to log
+    }
 }
 
 void printDictionary() {  // For testing
@@ -53,7 +149,7 @@ void setupWordBank(void) {
     int i = 0;
     char* buffer = malloc(MAX_DICTIONARY_WORD_SIZE * sizeof(char));
     while (fgets(buffer, MAX_DICTIONARY_WORD_SIZE, DictionaryUsed)) {
-        buffer[strlen(buffer)-1] = 0;  // Remove newline characters
+//        buffer[strlen(buffer)-1] = 0;  // Remove newline characters
         WordBank[i] = strdup(buffer);
         i++;
 
@@ -66,9 +162,135 @@ int isValidWord(const char* word) {
     for (size_t i = 0; i < wordBankSize; i++) {
         if (WordBank[i] == NULL) break;  // End of dictionary
 
-        if (!strcmp(WordBank[i], word)) {
+        if (!strcmp(WordBank[i], word)) {  // including newline
             return 1;
         }
+
+//        char *temp = strdup(word);
+//        temp[strlen(temp)-1] = '\000';
+//        if (!strcmp(WordBank[i], temp)) {  // without newline
+//            return 1;
+//        }
     }
     return 0;
+}
+
+int open_listenfd(int port)
+{
+    int listenfd, optval=1;
+    struct sockaddr_in serveraddr;
+
+    /* Create a socket descriptor */
+    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0){
+//    if ((listenfd = socket(AF_LOCAL, SOCK_STREAM, 0)) < 0){
+        return -1;
+    }
+
+    /* Eliminates "Address already in use" error from bind */
+    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR,
+                   (const void *)&optval , sizeof(int)) < 0){
+        return -1;
+    }
+
+    //Reset the serveraddr struct, setting all of it's bytes to zero.
+    //Some properties are then set for the struct, you don't
+    //need to worry about these.
+    //bind() is then called, associating the port number with the
+    //socket descriptor.
+    bzero((char *) &serveraddr, sizeof(serveraddr));
+    serveraddr.sin_family = AF_INET;
+//    serveraddr.sin_family = AF_LOCAL;
+    serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serveraddr.sin_port = htons((unsigned short)port);
+    if (bind(listenfd, (struct sockaddr*)&serveraddr, sizeof(serveraddr)) < 0){
+        return -1;
+    }
+
+    //Prepare the socket to allow accept() calls. The value 20 is
+    //the backlog, this is the maximum number of connections that will be placed
+    //on queue until accept() is called again.
+    if (listen(listenfd, 20) < 0){
+        return -1;
+    }
+
+    return listenfd;
+}
+
+int items[MAX_QUEUE_SIZE];  // the actual queue
+int front = -1, rear =-1;
+int isFull()
+{
+    if( (front == rear + 1) || (front == 0 && rear == MAX_QUEUE_SIZE-1)) return 1;
+    return 0;
+}
+int isEmpty()
+{
+    if(front == -1) return 1;
+    return 0;
+}
+void enQueue(int element)
+{
+    if (isFull()) printf("\n Queue is full!! \n");
+    else
+    {
+        if(front == -1) front = 0;
+        rear = (rear + 1) % MAX_QUEUE_SIZE;
+        items[rear] = element;
+        printf("\n Inserted -> %d", element);
+    }
+}
+int deQueue()
+{
+    int element;
+    if(isEmpty()) {
+        printf("\n Queue is empty !! \n");
+        return(-1);
+    } else {
+        element = items[front];
+        if (front == rear){
+            front = -1;
+            rear = -1;
+        } /* Q has only one element, so we reset the queue after dequeing it. ? */
+        else {
+            front = (front + 1) % MAX_QUEUE_SIZE;
+
+        }
+        printf("\n Deleted element -> %d \n", element);
+        return(element);
+    }
+}
+void display()
+{
+    int i;
+    if(isEmpty()) printf(" \n Empty Queue\n");
+    else
+    {
+        printf("\n Front -> %d ",front);
+        printf("\n Items -> ");
+        for( i = front; i!=rear; i=(i+1)%MAX_QUEUE_SIZE) {
+            printf("%d ",items[i]);
+        }
+        printf("%d ",items[i]);
+        printf("\n Rear -> %d \n",rear);
+    }
+}
+
+void Pthread_mutex_lock(pthread_mutex_t *mutex) {
+    int rc = pthread_mutex_lock(mutex);
+    assert(rc == 0);
+}
+
+void Pthread_mutex_unlock(pthread_mutex_t *mutex) {
+    int rc = pthread_mutex_unlock(mutex);
+    assert(rc == 0);
+}
+
+void Pthread_cond_wait(pthread_cond_t* cv, pthread_mutex_t* mutex) {
+    int rc = pthread_cond_wait(cv, mutex);
+    assert(rc == 0);
+}
+
+void Pthread_cond_signal(pthread_cond_t* cv) {
+    int rc = pthread_cond_signal(cv);
+    assert(rc == 0);
 }

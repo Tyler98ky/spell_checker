@@ -12,7 +12,7 @@
 #define MAX_ARR_SIZE 2048
 #define MAX_DICTIONARY_WORD_SIZE 100
 #define MAX_DICTIONARY_WORD_COUNT 110000  // 110,000
-#define DEFAULT_PORT 4444
+#define DEFAULT_PORT 12313
 #define DEFAULT_DICTIONARY "words"
 #define NUM_WORKERS 20
 #define MAX_QUEUE_SIZE 2048
@@ -38,6 +38,7 @@ void enQueue(int element);
 int isEmpty();
 int deQueue();
 void display();
+char *removeUnwantedCharacters(const char* word);
 void Pthread_mutex_lock(pthread_mutex_t *mutex);
 void Pthread_mutex_unlock(pthread_mutex_t *mutex);
 void Pthread_cond_signal(pthread_cond_t* cv);
@@ -52,6 +53,7 @@ int main(int argc, char *argv[]) {
     setupWordBank();
 
     listeningSocket = open_listenfd(PortUsed);
+    printf("Listening on port %d\n", PortUsed);
 
     pthread_t threadPool[NUM_WORKERS];
     int threadIDs[NUM_WORKERS];
@@ -62,10 +64,7 @@ int main(int argc, char *argv[]) {
     }
     printf("Threads launched. Now listening for incoming requests...\n");
 
-
-    while (1) {
-        producer();
-    }
+    producer();
 
     return EXIT_SUCCESS;
 }
@@ -74,14 +73,17 @@ void producer() {
     int connectionSocket;
 
     while (1) {
-        Pthread_mutex_lock(&lock);
         connectionSocket = accept(listeningSocket, NULL, NULL);  // connectionSocket is the file descriptor
+        Pthread_mutex_lock(&lock);
+//        char* clientMessage = "Hello! I hope you can see this.\n";
+//        send(connectionSocket, clientMessage, strlen(clientMessage), 0);
+
 
         while (isFull()) {
             Pthread_cond_wait(&empty, &lock);
         }
         enQueue(connectionSocket);  // "put()"
-        pthread_cond_broadcast(&fill);
+        Pthread_cond_signal(&fill);
         Pthread_mutex_unlock(&lock);
 
     }
@@ -95,33 +97,38 @@ void *consumer(void *arg) {
             Pthread_cond_wait(&fill, &lock);
         }
         int socketDescriptor = deQueue();  // "get()"
-        serviceClient(socketDescriptor);
-
-        pthread_cond_broadcast(&empty);
+        Pthread_cond_signal(&empty);
         Pthread_mutex_unlock(&lock);
 
+        serviceClient(socketDescriptor);
+
         // TODO close socket
-        shutdown(socketDescriptor, SHUT_RDWR);
+//        shutdown(socketDescriptor, SHUT_RDWR);
     }
 }
 
 
 void serviceClient(int socketDescriptor) {
-    while (!isEmpty()) {
-        char buffer[MAX_DICTIONARY_WORD_SIZE];
-        size_t bufferSize = MAX_DICTIONARY_WORD_SIZE * sizeof(char);
-        recv(socketDescriptor, buffer, bufferSize, 0);
-        if (strlen(buffer) == 0) continue;
+    size_t bufferSize = MAX_DICTIONARY_WORD_SIZE * sizeof(char);
+    char *buffer = malloc(bufferSize);
+    buffer[0] = '\0';
 
-        if (isValidWord(buffer)) {
-            strcat(buffer, " OK");
+    while (recv(socketDescriptor, buffer, bufferSize, 0) != 0) {
+        printf("received: %s\n", buffer);
+        char *temp = malloc(MAX_DICTIONARY_WORD_SIZE);
+        strcat(temp, removeUnwantedCharacters(buffer));
+
+        if (isValidWord(temp)) {
+            strcat(temp, " OK\n");
         } else {
-            strcat(buffer, " MISSPELLED");
+            strcat(temp, " MISSPELLED\n");
         }
 
-        send(socketDescriptor, buffer, strlen(buffer), 0);
+        send(socketDescriptor, temp, strlen(temp), 0);
         // TODO write to log
+        free(temp);
     }
+    free(buffer);
 }
 
 void printDictionary() {  // For testing
@@ -149,22 +156,28 @@ void setupWordBank(void) {
     int i = 0;
     char* buffer = malloc(MAX_DICTIONARY_WORD_SIZE * sizeof(char));
     while (fgets(buffer, MAX_DICTIONARY_WORD_SIZE, DictionaryUsed)) {
-//        buffer[strlen(buffer)-1] = 0;  // Remove newline characters
-        WordBank[i] = strdup(buffer);
+
+        WordBank[i] = removeUnwantedCharacters(buffer);
         i++;
 
     }
+
+    free(buffer);
 }
 
 int isValidWord(const char* word) {
     size_t wordBankSize = sizeof(WordBank) / sizeof(WordBank[0]);
 
     for (size_t i = 0; i < wordBankSize; i++) {
-        if (WordBank[i] == NULL) break;  // End of dictionary
+        if (WordBank[i] == NULL)
+            break;  // End of dictionary
 
-        if (!strcmp(WordBank[i], word)) {  // including newline
+
+        if (!strcasecmp(WordBank[i], removeUnwantedCharacters(word))) {  // including newline
             return 1;
         }
+
+
 
 //        char *temp = strdup(word);
 //        temp[strlen(temp)-1] = '\000';
@@ -173,6 +186,13 @@ int isValidWord(const char* word) {
 //        }
     }
     return 0;
+}
+
+char *removeUnwantedCharacters(const char* word) {
+    char* token = strtok(strdup(word), "\n");
+    char* token2 = strtok(token, "\r");
+
+    return token2;
 }
 
 int open_listenfd(int port)
@@ -217,7 +237,7 @@ int open_listenfd(int port)
 }
 
 int items[MAX_QUEUE_SIZE];  // the actual queue
-int front = -1, rear =-1;
+volatile int front = -1, rear =-1;
 int isFull()
 {
     if( (front == rear + 1) || (front == 0 && rear == MAX_QUEUE_SIZE-1)) return 1;

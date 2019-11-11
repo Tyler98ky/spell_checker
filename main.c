@@ -116,17 +116,21 @@ void serviceClient(int socketDescriptor) {
     while (recv(socketDescriptor, buffer, bufferSize, 0) != 0) {
         printf("received: %s\n", buffer);
         char *temp = malloc(MAX_DICTIONARY_WORD_SIZE);
-        strcat(temp, removeUnwantedCharacters(buffer));
+        if(buffer[0] != '\r' && buffer[0] != '\n') {
+            strcat(temp, removeUnwantedCharacters(buffer));
 
-        if (isValidWord(temp)) {
-            strcat(temp, " OK\n");
+            if (isValidWord(temp)) {
+                strcat(temp, " OK\n");
+            } else {
+                strcat(temp, " MISSPELLED\n");
+            }
+
+            send(socketDescriptor, temp, strlen(temp), 0);
+            // TODO write to log
+            free(temp);
         } else {
-            strcat(temp, " MISSPELLED\n");
+            send(socketDescriptor, "", strlen(""), 0);
         }
-
-        send(socketDescriptor, temp, strlen(temp), 0);
-        // TODO write to log
-        free(temp);
     }
     free(buffer);
 }
@@ -159,7 +163,6 @@ void setupWordBank(void) {
 
         WordBank[i] = removeUnwantedCharacters(buffer);
         i++;
-
     }
 
     free(buffer);
@@ -172,18 +175,9 @@ int isValidWord(const char* word) {
         if (WordBank[i] == NULL)
             break;  // End of dictionary
 
-
         if (!strcasecmp(WordBank[i], removeUnwantedCharacters(word))) {  // including newline
             return 1;
         }
-
-
-
-//        char *temp = strdup(word);
-//        temp[strlen(temp)-1] = '\000';
-//        if (!strcmp(WordBank[i], temp)) {  // without newline
-//            return 1;
-//        }
     }
     return 0;
 }
